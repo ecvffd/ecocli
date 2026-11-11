@@ -1,0 +1,87 @@
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Lint and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+
+  deploy:
+    name: Deploy to REG.RU
+    needs: ci
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment:
+      name: production
+      url: https://ecoclinic.pro
+    concurrency:
+      group: ecocli-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Upload and activate release
+        shell: bash
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$SSH_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ||
+                ! "$SSH_USER" =~ ^[a-z_][a-z0-9_-]*$ ||
+                "$SSH_USER" == root ||
+                -z "$SSH_PRIVATE_KEY" || -z "$SSH_KNOWN_HOSTS" ]]; then
+            echo "::error::Configure the production SSH secrets for the deploy account."
+            exit 1
+          fi
+
+          umask 077
+          local_tmp=$(mktemp -d)
+          remote_tmp=
+          cleanup() {
+            if [[ -n "$remote_tmp" ]]; then
+              ssh "${ssh_options[@]}" "$target" "rm -rf -- '$remote_tmp'" || true
+            fi
+            rm -rf -- "$local_tmp"
+          }
+          trap cleanup EXIT
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$local_tmp/key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$local_tmp/known_hosts"
+          ssh_options=(-i "$local_tmp/key" -o IdentitiesOnly=yes -o BatchMode=yes
+            -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$local_tmp/known_hosts"
+            -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+          target="$SSH_USER@$SSH_HOST"
+
+          release="$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          git archive --format=tar.gz HEAD > "$local_tmp/source.tar.gz"
+          upload_dir=$(ssh "${ssh_options[@]}" "$target" 'mktemp -d /tmp/ecocli.XXXXXXXX')
+          [[ "$upload_dir" =~ ^/tmp/ecocli\.[A-Za-z0-9]+$ ]]
+          remote_tmp="$upload_dir"
+          ssh "${ssh_options[@]}" "$target" "cat > '$remote_tmp/source.tar.gz'" < "$local_tmp/source.tar.gz"
+          ssh "${ssh_options[@]}" "$target" \
+            "bash -s -- '$remote_tmp/source.tar.gz' '$release'" < .github/scripts/deploy.sh
